@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { addresses, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, isPublic, provisioningSite, trafficCorrection } from "./api.ts"
+import { addresses, badIfaceName, changes, currentIface, GIB, ifaceChoice, ifaceSpec, isPublic, loopbackOrigin, provisionRefusal, provisioningSite, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -8,6 +8,28 @@ assert.deepEqual(changes({ expires_at: "2030-01-01" as string | null }, { expire
 assert.equal(provisioningSite("https://monitor.example.com:8443/"), "https://monitor.example.com:8443")
 for (const site of ["http://monitor.example.com", "https://127.0.0.1", "https://[::1]", "https://2130706433", "https://0x7f000001", "https://localhost", "https://user@monitor.example.com", "https://monitor.example.com/path"]) {
   assert.equal(provisioningSite(site), "", site)
+}
+// A tunnelled panel: the hub allows it alongside --site, so the panel must read
+// the same addresses as loopback, and a name merely beginning with one as not.
+for (const origin of ["http://127.0.0.1:9911", "http://localhost:9911", "http://[::1]:9911", "https://127.0.0.1"]) {
+  assert.equal(loopbackOrigin(origin), true, origin)
+}
+for (const origin of ["https://monitor.example.com", "http://127.0.0.1.example.com", "ftp://127.0.0.1", "nonsense"]) {
+  assert.equal(loopbackOrigin(origin), false, origin)
+}
+// The refusal names the cause the operator can act on, as the hub decides it.
+// A loopback --site is a bad --site, not a missing one.
+for (const [origin, site, cause] of [
+  ["https://monitor.example.com", "", ""],
+  ["https://monitor.example.com", "https://hub.example.com", ""],
+  ["http://127.0.0.1:9911", "https://hub.example.com", ""],
+  ["http://127.0.0.1:9911", "", "加 --site"],
+  ["http://127.0.0.1:9911", "http://127.0.0.1:28080", "不是 https 域名"],
+  ["https://monitor.example.com", "https://198.51.100.1", "不是 https 域名"],
+  ["http://198.51.100.1:28080", "https://hub.example.com", "请通过 HTTPS 域名"],
+]) {
+  const refusal = provisionRefusal(origin, site)
+  assert.ok(cause ? refusal.includes(cause) : refusal === "", `${origin} ${site}: ${refusal}`)
 }
 // An emptied traffic field means the counter is not to be corrected. Sent as 0
 // it would clear a lifetime total, which must never decrease.

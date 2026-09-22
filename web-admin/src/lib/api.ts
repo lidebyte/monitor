@@ -166,6 +166,37 @@ export function provisioningSite(site: string): string {
   }
 }
 
+/**
+ * Whether this is the hub's own machine in the address bar, which is what a
+ * tunnel into the panel leaves there. The hub applies the same test: such an
+ * entry is not in the clear, but it names no address a node could reach, so it
+ * provisions only alongside `--site`.
+ */
+export function loopbackOrigin(origin: string): boolean {
+  try {
+    const { protocol, hostname } = new URL(origin)
+    return (protocol === "https:" || protocol === "http:")
+      && (hostname === "localhost" || hostname.endsWith(".localhost")
+        || hostname === "[::1]" || /^127\.\d+\.\d+\.\d+$/.test(hostname))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Why nodes cannot be added or installed from this page, or "" when they can.
+ * `origin` is the page's own, which reaches the hub as `Origin`; `site` is
+ * `--site`, empty when none is set. The hub's `provisioning_allowed` applies the
+ * same rule, and a GET carries no `Origin` for it to answer this in advance.
+ */
+export function provisionRefusal(origin: string, site: string): string {
+  if (site && !provisioningSite(site)) return "hub 的 --site 不是 https 域名，改正后才能添加或安装节点。"
+  if (provisioningSite(origin) || (loopbackOrigin(origin) && site)) return ""
+  return loopbackOrigin(origin)
+    ? "从隧道或回环地址进面板时，要给 hub 加 --site 指定节点可达的 https 域名。"
+    : "请通过 HTTPS 域名访问面板后添加或安装节点。"
+}
+
 /** The agent's `--iface` as the install dialogs edit it: names to count alone, names to leave out. */
 export type IfaceChoice = { only: string; skip: string }
 

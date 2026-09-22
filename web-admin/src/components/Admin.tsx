@@ -775,7 +775,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   )
 }
 
-function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh: () => void; site: string; canProvision: boolean }) {
+function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () => void; site: string; refusal: string }) {
   const [creating, setCreating] = useState(false)
   const [editing, setEditing] = useState<Node | null>(null)
   const [billing, setBilling] = useState<Node | null>(null)
@@ -798,7 +798,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
   // every node.
   const visible = searchNodes(order, query)
   const searching = query.trim() !== ""
-  const uninstall = canProvision ? uninstallCommand(site) : ""
+  const uninstall = refusal ? "" : uninstallCommand(site)
 
   async function remove() {
     if (!deleting) return
@@ -845,15 +845,15 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
 
   return (
     <div className="space-y-4">
-      {!canProvision && <p className="text-sm text-muted-foreground">请通过 HTTPS 域名访问面板后添加或安装节点。</p>}
+      {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
         <NodeSearch className="mr-auto w-full sm:w-64" value={query} onChange={setQuery} />
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
-        <Button variant="outline" disabled={!canProvision} onClick={() => setRegistering(true)}>
+        <Button variant="outline" disabled={!!refusal} onClick={() => setRegistering(true)}>
           <Server /> 批量添加{reg.left > 0 && ` · ${Math.ceil(reg.left / 60)} 分`}
         </Button>
-        <Button disabled={!canProvision} onClick={() => setCreating(true)}>
+        <Button disabled={!!refusal} onClick={() => setCreating(true)}>
           <Plus /> 添加节点
         </Button>
       </div>
@@ -957,7 +957,7 @@ function Nodes({ nodes, refresh, site, canProvision }: { nodes: Node[]; refresh:
                 </TableCell>
                 <TableCell className="text-sm">{n.expires_at || FOREVER}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
-                  <Button variant="ghost" size="icon" disabled={!canProvision} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
+                  <Button variant="ghost" size="icon" disabled={!!refusal} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => setEditing(n)} title="编辑节点" aria-label="编辑节点">
@@ -2117,14 +2117,14 @@ export function Admin({
   nodes,
   refresh,
   site,
-  canProvision,
+  refusal,
 }: {
   path: string
   go: (to: string) => void
   nodes: Node[]
   refresh: () => void
   site: string
-  canProvision: boolean
+  refusal: string
 }) {
   return (
     <div className="flex flex-col gap-6 md:flex-row">
@@ -2161,7 +2161,7 @@ export function Admin({
         ) : path === "/admin/settings" ? (
           <SettingsTab />
         ) : (
-          <Nodes nodes={nodes} refresh={refresh} site={site} canProvision={canProvision} />
+          <Nodes nodes={nodes} refresh={refresh} site={site} refusal={refusal} />
         )}
       </div>
     </div>
