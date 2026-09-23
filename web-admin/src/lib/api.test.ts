@@ -1,6 +1,6 @@
 /// <reference types="node" />
 import assert from "node:assert/strict"
-import { addresses, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, ifaceChoice, ifaceSpec, isPublic, loopbackOrigin, outdatedAgents, provisionRefusal, provisioningSite, trafficCorrection } from "./api.ts"
+import { addresses, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, isPublic, loopbackOrigin, outdatedAgents, provisioningSite, provisionRefusal, trafficCorrection } from "./api.ts"
 
 assert.deepEqual(changes({ public: true, price: 5 }, { price: 20 }), { price: 20 })
 assert.deepEqual(changes({ total_rx: "100", month_tx: "2" }, { total_rx: "100", month_tx: "3" }), { month_tx: "3" })
@@ -108,6 +108,15 @@ assert.equal(ifaceSpec(ifaceChoice("enp1s0,-enp5s0")), "enp1s0,-enp5s0")
 assert.equal(currentIface({ metrics: null }), undefined)
 assert.equal(currentIface({ metrics: {} as never }), "")
 assert.equal(currentIface({ metrics: { iface: "eth1,-eth0" } as never }), "eth1,-eth0")
+
+// Groups follow the node order, and the filter keeps ungrouped nodes apart from
+// a group whose name merely resembles a sentinel.
+const fleet2 = [{ group: "东京" }, { group: "" }, { group: "none" }, { group: "东京" }, {}]
+assert.deepEqual(groupsOf(fleet2), ["东京", "none"])
+assert.equal(inGroup(fleet2, "all").length, 5)
+assert.equal(inGroup(fleet2, "none").length, 2)
+assert.deepEqual(inGroup(fleet2, "=none"), [{ group: "none" }])
+assert.equal(inGroup(fleet2, "=东京").length, 2)
 
 // A theme's form: malformed fields drop out one by one, a saved value the field
 // can no longer hold shows the default, and only changes from a default are stored.

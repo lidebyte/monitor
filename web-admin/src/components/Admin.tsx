@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, ChevronRight, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { addresses, api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, ifaceChoice, ifaceSpec, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
+import { addresses, api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
 import { bytes, CYCLES, FOREVER, money, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
@@ -74,26 +74,61 @@ function Addresses({ node }: { node: Node }) {
   )
 }
 
-// Name, address and country: what a node is looked up by, in every node list.
+// Name, address, country and group: what a node is looked up by, in every node list.
 function searchNodes(nodes: Node[], query: string) {
   const needle = query.trim().toLowerCase()
   if (!needle) return nodes
   return nodes.filter((n) =>
-    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country].some((v) => v?.toLowerCase().includes(needle)))
+    [n.name, n.ip, n.ipv4, n.ipv6, n.ipv4_pin, n.ipv6_pin, n.country, n.group].some((v) => v?.toLowerCase().includes(needle)))
+}
+
+// A filter naming a group no node carries any more -- renamed, or its last node
+// deleted -- falls back to all rather than showing an empty list; so does 未分组
+// once no group is left, since the dropdown that would clear it is hidden then.
+// Reset rather than masked, so the old filter does not return with a later group
+// of the same name.
+function useGroupFilter(nodes: Node[]) {
+  const [filter, setFilter] = useState("all")
+  const valid = filter === "all"
+    || (filter === "none" ? nodes.some((n) => n.group) : nodes.some((n) => n.group === filter.slice(1)))
+  if (!valid) setFilter("all")
+  return [valid ? filter : "all", setFilter] as const
+}
+
+// Offered once some node has a group. 未分组 is where a batch of freshly
+// registered machines waits to be assigned one.
+function GroupFilter({ nodes, value, onChange, className = "" }: {
+  nodes: Node[]
+  value: string
+  onChange: (value: string) => void
+  className?: string
+}) {
+  const groups = groupsOf(nodes)
+  if (!groups.length) return null
+  return (
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger className={className} aria-label="按分组筛选"><SelectValue /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="all">全部分组</SelectItem>
+        {groups.map((g) => <SelectItem key={g} value={`=${g}`}>{g}</SelectItem>)}
+        <SelectItem value="none">未分组</SelectItem>
+      </SelectContent>
+    </Select>
+  )
 }
 
 function NodeSearch({ value, onChange, className = "" }: { value: string; onChange: (value: string) => void; className?: string }) {
   return (
     <div className={`relative ${className}`}>
       <Search className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
-      <Input className="pl-8" placeholder="名称/地址/地区" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
+      <Input className="pl-8" placeholder="名称/地址/地区/分组" aria-label="搜索节点" value={value} onChange={(e) => onChange(e.target.value)} />
     </div>
   )
 }
 
 // Ticks nodes in a searchable grid. 全选 and 全不选 act on the rows in view, so a
-// search narrows what they touch: search JP, then 全选. Offline nodes are dimmed
-// but remain selectable.
+// search or a group narrows what they touch: pick a group, then 全选. Offline
+// nodes are dimmed but remain selectable.
 function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   nodes: Node[]
   chosen: Set<number>
@@ -101,15 +136,17 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
   disabled?: boolean
 }) {
   const [query, setQuery] = useState("")
+  const [group, setGroup] = useGroupFilter(nodes)
   // The unfiltered list's height, held as its floor: in a centred dialog a
   // shrinking list would move the search box out from under the cursor.
   const [listHeight, setListHeight] = useState(0)
-  const visible = searchNodes(nodes, query)
+  const visible = inGroup(searchNodes(nodes, query), group)
   const visibleChosen = visible.filter((n) => chosen.has(n.id)).length
   return (
     <div className="rounded-lg border">
-      <div className="flex items-center gap-1 border-b p-2">
-        <NodeSearch className="min-w-0 flex-1" value={query} onChange={setQuery} />
+      <div className="flex flex-wrap items-center gap-1 border-b p-2">
+        <NodeSearch className="min-w-0 flex-1 basis-40" value={query} onChange={setQuery} />
+        <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
         <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === visible.length} onClick={() => onPick(visible, true)}>全选</Button>
         <Button size="sm" variant="ghost" className="px-2.5" disabled={disabled || visibleChosen === 0} onClick={() => onPick(visible, false)}>全不选</Button>
       </div>
@@ -122,7 +159,7 @@ function NodePicker({ nodes, chosen, onPick, disabled = false }: {
         className="grid max-h-[min(16rem,40dvh)] grid-cols-2 content-start gap-0.5 overflow-y-auto p-1.5 sm:grid-cols-3"
       >
         {visible.map((n) => (
-          <label key={n.id} title={n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
+          <label key={n.id} title={n.group ? `${n.name} · ${n.group}` : n.name} className="flex min-w-0 cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm hover:bg-muted">
             <input type="checkbox" checked={chosen.has(n.id)} disabled={disabled} onChange={(e) => onPick([n], e.target.checked)} className="shrink-0 accent-primary" />
             <span className={`truncate ${n.online ? "" : "text-muted-foreground"}`}>{n.name}</span>
             {n.country && <span className="ml-auto shrink-0 text-xs text-muted-foreground">{n.country}</span>}
@@ -182,6 +219,82 @@ function OptionRow({ title, hint, toggle = false, below, children }: {
   )
 }
 
+
+// Free text, with the groups already in use offered, so a group is picked
+// rather than retyped, where a typo would start a second one.
+function GroupInput({ groups, value, onChange }: { groups: string[]; value: string; onChange: (value: string) => void }) {
+  const id = useId()
+  return (
+    <>
+      <Input list={id} maxLength={32} value={value} onChange={(e) => onChange(e.target.value)} placeholder="未分组" />
+      <datalist id={id}>
+        {groups.map((g) => <option key={g} value={g} />)}
+      </datalist>
+    </>
+  )
+}
+
+// Puts the nodes ticked here into one group, or, with the name left empty, out
+// of any. Renaming or dissolving a group is the same act: filter the picker to
+// it, tick all, then type the new name or clear it. One request, applied to all
+// of them or none.
+function GroupDialog({ nodes, onClose, onSaved }: { nodes: Node[]; onClose: () => void; onSaved: () => void }) {
+  const [name, setName] = useState("")
+  const [chosen, setChosen] = useState<Set<number>>(new Set())
+  const [saving, setSaving] = useState(false)
+  const group = name.trim()
+  // Counted against the live list, so a node deleted meanwhile is not sent.
+  const ids = nodes.filter((n) => chosen.has(n.id)).map((n) => n.id)
+  const pick = (list: Node[], on: boolean) =>
+    setChosen((old) => {
+      const next = new Set(old)
+      for (const n of list) {
+        if (on) next.add(n.id)
+        else next.delete(n.id)
+      }
+      return next
+    })
+
+  async function save() {
+    setSaving(true)
+    try {
+      await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { group } }) })
+      toast.success(group ? `已把 ${ids.length} 台设为「${group}」` : `已把 ${ids.length} 台移出分组`)
+      onClose()
+      onSaved()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent onOpenAutoFocus={(e) => e.preventDefault()} className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>设置分组</DialogTitle>
+          <DialogDescription className="leading-relaxed">
+            勾选节点，设为同一个分组。改名或解散：先筛选出这个分组、全选，再填新名字或清空。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4">
+          <Field label="分组名" hint="公开页可见，最多 32 字；留空为移出分组">
+            <GroupInput groups={groupsOf(nodes)} value={name} onChange={setName} />
+          </Field>
+          <NodePicker nodes={nodes} chosen={chosen} onPick={pick} />
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button onClick={save} disabled={saving || !ids.length} className="max-w-full gap-0">
+            <span className="truncate">{group ? `设为「${group}」` : "移出分组"}</span>
+            {ids.length > 0 && <span className="tnum shrink-0">（{ids.length} 台）</span>}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
 
 function ConfirmDialog({ title, description, confirmLabel, busy = false, onClose, onConfirm, children }: {
   title: string
@@ -255,8 +368,9 @@ function CreateNode({ onClose, onSaved }: {
   )
 }
 
-function NodeForm({ node, onClose, onSaved }: {
+function NodeForm({ node, groups, onClose, onSaved }: {
   node: Node
+  groups: string[]
   onClose: () => void
   onSaved: () => void
 }) {
@@ -281,6 +395,7 @@ function NodeForm({ node, onClose, onSaved }: {
       name: form.name.trim(),
       public: form.public,
       remark: form.remark,
+      group: (form.group ?? "").trim(),
       traffic_mode: form.traffic_mode,
       traffic_limit: Math.round(Number(limitGib) * GIB),
       traffic_reset_day: Math.min(31, Math.max(1, Math.round(Number(form.traffic_reset_day) || 1))),
@@ -328,8 +443,11 @@ function NodeForm({ node, onClose, onSaved }: {
               <Field label="名称">
                 <Input value={form.name} onChange={(e) => set("name", e.target.value)} />
               </Field>
-              <Field label="备注">
-                <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="商家、用途，仅管理员可见" />
+              <Field label="分组" hint="公开页可见，留空为未分组">
+                <GroupInput groups={groups} value={form.group ?? ""} onChange={(v) => set("group", v)} />
+              </Field>
+              <Field label="备注" className="sm:col-span-2">
+                <Input value={form.remark ?? ""} onChange={(e) => set("remark", e.target.value)} placeholder="仅管理员可见" />
               </Field>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
@@ -845,6 +963,8 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const [removing, setRemoving] = useState(false)
   const [manualOrder, setManualOrder] = useState<number[]>([])
   const [query, setQuery] = useState("")
+  const [group, setGroup] = useGroupFilter(nodes)
+  const [grouping, setGrouping] = useState(false)
   const [dragging, setDragging] = useState<number | null>(null)
   const orderBeforeDrag = useRef<number[]>([])
   const byId = new Map(nodes.map((node) => [node.id, node]))
@@ -855,8 +975,8 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   ]
   // `order` itself stays whole, because the order sent on drop is the order of
   // every node.
-  const visible = searchNodes(order, query)
-  const searching = query.trim() !== ""
+  const visible = inGroup(searchNodes(order, query), group)
+  const searching = query.trim() !== "" || group !== "all"
   const uninstall = refusal ? "" : uninstallCommand(site)
 
   async function remove() {
@@ -906,7 +1026,13 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     <div className="space-y-4">
       {refusal && <p className="text-sm text-muted-foreground">{refusal}</p>}
       <div className="flex flex-wrap items-center justify-end gap-2">
-        <NodeSearch className="mr-auto w-full sm:w-64" value={query} onChange={setQuery} />
+        <div className="mr-auto flex w-full gap-2 sm:w-auto">
+          <NodeSearch className="min-w-0 flex-1 sm:w-64 sm:flex-none" value={query} onChange={setQuery} />
+          <GroupFilter nodes={nodes} value={group} onChange={setGroup} className="w-32" />
+        </div>
+        <Button variant="outline" disabled={!nodes.length} onClick={() => setGrouping(true)}>
+          <Layers /> 分组
+        </Button>
         {/* An open window is visible from the list itself, so nobody has to
             remember they left one open. */}
         <Button variant="outline" disabled={!!refusal} onClick={() => setRegistering(true)}>
@@ -953,7 +1079,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                       // is the full one exactly while nothing is filtered out.
                       disabled={searching}
                       className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
-                      title={searching ? "清空搜索后可拖动排序" : "拖动排序"}
+                      title={searching ? "清空搜索和分组筛选后可拖动排序" : "拖动排序"}
                       aria-label={`拖动 ${n.name} 排序`}
                       onDragStart={(e) => {
                         orderBeforeDrag.current = order.map((node) => node.id)
@@ -974,7 +1100,10 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                     >
                       <GripVertical className="size-4" />
                     </button>
-                    <div className="min-w-0 font-medium">{n.name}</div>
+                    <div className="min-w-0">
+                      <div className="font-medium">{n.name}</div>
+                      {n.group && <div className="truncate text-xs text-muted-foreground">{n.group}</div>}
+                    </div>
                     {n.country && (
                       <Badge
                         variant="outline"
@@ -1058,10 +1187,12 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       {editing && (
         <NodeForm
           node={editing}
+          groups={groupsOf(nodes)}
           onClose={() => setEditing(null)}
           onSaved={refresh}
         />
       )}
+      {grouping && <GroupDialog nodes={order} onClose={() => setGrouping(false)} onSaved={refresh} />}
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
@@ -1857,36 +1988,63 @@ function ChannelCard({ title, configured, children }: { title: string; configure
 }
 
 // Offline alerts are opt-in per node, so turning them on for a fleet needs one
-// place rather than one dialog per node.
+// place rather than one dialog per node. Ticks are a draft until 保存, like every
+// other form in the panel: a request per click would make each tick wait on a
+// round trip and a refresh before showing.
 function OfflineNodes({ nodes, refresh }: { nodes: Node[]; refresh: () => void }) {
-  const [busy, setBusy] = useState(false)
+  // Only the ticks changed here, by node id. A snapshot of every node's state
+  // would send back a node another session switched meanwhile.
+  const [draft, setDraft] = useState<Map<number, boolean>>(new Map())
+  const [saving, setSaving] = useState(false)
+  const on = (n: Node) => draft.get(n.id) ?? !!n.notify
+  const chosen = new Set(nodes.filter(on).map((n) => n.id))
+  // Against the live list, so a node deleted meanwhile is neither counted nor sent.
+  const turnOn = nodes.filter((n) => on(n) && !n.notify).map((n) => n.id)
+  const turnOff = nodes.filter((n) => !on(n) && n.notify).map((n) => n.id)
+  const dirty = turnOn.length + turnOff.length > 0
 
-  async function apply(targets: Node[], on: boolean) {
-    setBusy(true)
+  // Kept after a save until the list reports it, so the ticks do not flash back
+  // to the old state for a round trip. Adjusted during render rather than in an
+  // effect, as it follows from props alone.
+  if (draft.size && !dirty && !saving) setDraft(new Map())
+
+  const pick = (list: Node[], value: boolean) =>
+    setDraft((old) => {
+      const next = new Map(old)
+      for (const n of list) next.set(n.id, value)
+      return next
+    })
+
+  async function save() {
+    setSaving(true)
     try {
-      // Awaited in turn, the requests would cost one round trip per node, and
-      // the two-second stream would render each one as it lands.
-      await Promise.all(
-        targets
-          .filter((n) => !!n.notify !== on)
-          .map((n) => api(`/nodes/${n.id}`, { method: "PUT", body: JSON.stringify({ notify: on }) })),
-      )
+      for (const [ids, on] of [[turnOn, true], [turnOff, false]] as const) {
+        if (ids.length) await api("/nodes/batch", { method: "PUT", body: JSON.stringify({ ids, patch: { notify: on } }) })
+      }
+      toast.success("离线通知已保存")
     } catch (e) {
       toast.error((e as Error).message)
     } finally {
       refresh()
-      setBusy(false)
+      setSaving(false)
     }
   }
 
-  const enabled = new Set(nodes.filter((n) => n.notify).map((n) => n.id))
+  const pending = [turnOn.length && `打开 ${turnOn.length} 台`, turnOff.length && `关闭 ${turnOff.length} 台`].filter(Boolean)
   return (
     <Card className="gap-4 p-5">
       <div>
         <h3 className="text-sm font-medium">离线通知</h3>
-        <p className="mt-1 text-xs text-muted-foreground">按节点打开，默认关。已打开 {enabled.size} / {nodes.length} 台</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          按节点打开，默认关。已打开 {nodes.filter((n) => n.notify).length} / {nodes.length} 台
+          {pending.length > 0 && <span className="text-foreground">，待保存：{pending.join("、")}</span>}
+        </p>
       </div>
-      <NodePicker nodes={nodes} chosen={enabled} onPick={apply} disabled={busy} />
+      <NodePicker nodes={nodes} chosen={chosen} onPick={pick} disabled={saving} />
+      <div className="flex justify-end gap-2">
+        <Button size="sm" variant="ghost" disabled={!dirty || saving} onClick={() => setDraft(new Map())}>撤销</Button>
+        <Button size="sm" disabled={!dirty || saving} onClick={save}>保存</Button>
+      </div>
     </Card>
   )
 }

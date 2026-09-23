@@ -100,6 +100,9 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // in, which is what a status page conveys, without locating it. The
         // address it was derived from remains behind the panel.
         "country": if node.country_pin.is_empty() { &node.country } else { &node.country_pin },
+        // Named by the operator for the status page to divide the list by, so
+        // public like the node's name. Empty is ungrouped.
+        "group": node.group,
         "sort": node.sort,
         "public": node.public,
         "online": current.is_some(),
@@ -535,6 +538,37 @@ fn node_limits(reset_day: Option<u32>, price: Option<f64>, limit: Option<i64>) -
     None
 }
 
+/// A theme shows the group as a tab label, so it is held to a short one.
+const MAX_GROUP: usize = 32;
+
+/// Trims a group name, or refuses it. Refused rather than truncated: the panel
+/// would otherwise report saved a name that is not the one stored.
+fn group_error(group: &mut String) -> Option<&'static str> {
+    *group = group.trim().to_owned();
+    if group.chars().count() > MAX_GROUP || group.chars().any(char::is_control) {
+        return Some("group must be at most 32 characters, without control characters");
+    }
+    None
+}
+
+/// Normalizes a patch, or names the first value that cannot be stored. The one
+/// check both the single and the batch write pass through, so the two accept
+/// exactly the same values.
+fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
+    if let Some(name) = &mut node.name {
+        *name = name.trim().to_owned();
+        if name.is_empty() {
+            return Some("name is required");
+        }
+    }
+    if let Some(group) = &mut node.group {
+        if let Some(message) = group_error(group) {
+            return Some(message);
+        }
+    }
+    node_limits(node.traffic_reset_day, node.price, node.traffic_limit).or_else(|| pins(node))
+}
+
 /// Normalizes the values set by hand, or names the one that cannot stand. Each
 /// takes the place of an automatic value, so it is held to what that value would
 /// have to be: the country to the rule a looked-up one passes, as both reach the
@@ -598,6 +632,7 @@ pub async fn create_node(
     }
     if let Some(message) =
         node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
+            .or_else(|| group_error(&mut node.group))
     {
         return bad(message);
     }
@@ -769,16 +804,7 @@ pub async fn update_node(
     body: Result<Json<NodePatch>, JsonRejection>,
 ) -> Response {
     let Ok(Json(mut node)) = body else { return bad("invalid node") };
-    if let Some(name) = &mut node.name {
-        *name = name.trim().to_owned();
-        if name.is_empty() {
-            return bad("name is required");
-        }
-    }
-    if let Some(message) = node_limits(node.traffic_reset_day, node.price, node.traffic_limit) {
-        return bad(message);
-    }
-    if let Some(message) = pins(&mut node) {
+    if let Some(message) = patch_error(&mut node) {
         return bad(message);
     }
     match app.db.update_node(id, &node) {
@@ -787,6 +813,53 @@ pub async fn update_node(
             Json(json!({"ok": true})).into_response()
         }
         Ok(false) => no_such_node(),
+        Err(e) => fail(e),
+    }
+}
+
+/// What a batch may set: the settings the panel applies across a selection.
+/// An allowlist, so a field added to [`NodePatch`] later, possibly one that
+/// describes a single machine, is refused here until it is listed.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct BatchPatch {
+    group: Option<String>,
+    notify: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct NodeBatch {
+    ids: Vec<i64>,
+    #[serde(default)]
+    patch: BatchPatch,
+}
+
+/// Applies one patch to every selected node, all or none.
+pub async fn update_nodes(
+    _: Admin,
+    State(app): State<Shared>,
+    body: Result<Json<NodeBatch>, JsonRejection>,
+) -> Response {
+    let Ok(Json(NodeBatch { mut ids, patch })) = body else {
+        return bad("invalid batch: only group and notify apply to several nodes at once");
+    };
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return bad("no nodes selected");
+    }
+    let mut patch = NodePatch { group: patch.group, notify: patch.notify, ..Default::default() };
+    if let Some(message) = patch_error(&mut patch) {
+        return bad(message);
+    }
+    match app.db.update_nodes(&ids, &patch) {
+        Ok(true) => {
+            invalidate_snapshot(&app);
+            Json(json!({"updated": ids.len()})).into_response()
+        }
+        Ok(false) => {
+            (StatusCode::NOT_FOUND, "有节点已被删除，没有做任何修改；刷新后重新选择").into_response()
+        }
         Err(e) => fail(e),
     }
 }
@@ -2299,6 +2372,44 @@ mod tests {
             "the old agent's channel must be closed"
         );
         assert!(app.agents.read().unwrap().is_empty(), "the node must read as offline at once");
+    }
+
+    /// A batch writes to every selected node or to none, accepts only what a
+    /// selection can share, and a group reaches the status page.
+    #[tokio::test]
+    async fn a_batch_edit_applies_to_all_selected_nodes_or_none() {
+        let app = std::sync::Arc::new(app());
+        let state = || axum::extract::State(app.clone());
+        let (a, b, c) = (node(&app, "a", true), node(&app, "b", true), node(&app, "c", true));
+        let batch = |ids: Vec<i64>, patch: Value| {
+            Ok(Json(NodeBatch { ids, patch: serde_json::from_value(patch).unwrap() }))
+        };
+        let group = |id| app.db.node(id).unwrap().unwrap().group;
+
+        let r =
+            update_nodes(Admin, state(), batch(vec![a, b, a], json!({"group": " 香港 ", "notify": true})))
+                .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!((group(a), group(b), group(c)), ("香港".into(), "香港".into(), String::new()));
+        assert!(app.db.node(b).unwrap().unwrap().notify);
+
+        // One id gone: nothing is written, not even to the nodes still there.
+        let r = update_nodes(Admin, state(), batch(vec![a, 999], json!({"group": "东京"}))).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(group(a), "香港", "a refused batch leaves every node as it was");
+
+        // Only the listed fields deserialize, so the extractor refuses the rest.
+        for refused in [json!({"name": "x"}), json!({"ipv4_pin": "1.2.3.4"}), json!({"public": false})] {
+            assert!(serde_json::from_value::<BatchPatch>(refused.clone()).is_err(), "{refused}");
+        }
+        let r = update_nodes(Admin, state(), batch(vec![a], json!({"group": "g".repeat(33)}))).await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            update_nodes(Admin, state(), batch(vec![], json!({"notify": false}))).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        assert!(live_snapshot(&app, false).as_str().contains(r#""group":"香港""#), "the group is public");
     }
 
     /// What the panel saves is what an anonymous visitor reads, under the same
