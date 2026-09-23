@@ -524,9 +524,11 @@ function ifaceArg(iface: string | undefined) {
 // One command for a batch of machines. The key belongs to the hub, is valid only
 // within the window it opened, and each machine exchanges it for a token of its
 // own, so unlike an install command this text is no one's credential and can be
-// used directly in a loop.
-function registerCommand(site: string, key: string, iface: string | undefined) {
-  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...ifaceArg(iface)])
+// sent to every machine as it is. An interval left untouched is left out, as an
+// untouched --iface is: a rerun then keeps what the machine already has.
+function registerCommand(site: string, key: string, seconds: number | undefined, iface: string | undefined) {
+  const interval = seconds === undefined ? [] : [`--interval ${seconds}`]
+  return scriptCommand(site, (s) => [`--server ${s}`, `--register ${key}`, ...interval, ...ifaceArg(iface)])
 }
 
 // Carries no token, so it is the same for every node and remains valid after the
@@ -581,7 +583,8 @@ function RegisterDialog({ site, reg, onClose }: {
   onClose: () => void
 }) {
   const iface = useIfaceOption(undefined)
-  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, iface.flag) : ""
+  const interval = useIntervalOption()
+  const command = reg.left > 0 && iface.valid ? registerCommand(site, reg.key, interval.edited ? interval.seconds : undefined, iface.flag) : ""
   const clock = `${Math.floor(reg.left / 60)}:${String(reg.left % 60).padStart(2, "0")}`
 
   return (
@@ -594,10 +597,11 @@ function RegisterDialog({ site, reg, onClose }: {
           {/* One string: JSX turns a line break inside CJK text into a visible space. */}
           <p className="text-sm text-muted-foreground">
             {"开一个一小时的注册窗口。期间这条命令在任意机器上跑一次，那台机器就会自己出现在列表里，" +
-              "名字取自它的 hostname。命令里没有任何一台机器的凭证，可以直接进循环。"}
+              "名字默认取它的 hostname。命令里没有任何一台机器的凭证，可以同时发给多台机器。"}
           </p>
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
+            <IntervalOption option={interval} batch />
             <IfaceOption option={iface} batch />
           </section>
           {reg.left > 0 ? (
@@ -606,6 +610,18 @@ function RegisterDialog({ site, reg, onClose }: {
               <Command className={`max-h-40 min-h-24 ${command ? "" : "text-muted-foreground"}`}>
                 {command || "网卡名有误，改正后显示命令"}
               </Command>
+              {/* Per machine, so it cannot be part of the one command. */}
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                要给某台单独起名，在它执行的命令末尾加 <code>--name 名字</code>，只对新建的节点生效。
+                <a
+                  className="ml-1 underline underline-offset-2 hover:text-foreground"
+                  href="https://monitor-document.pages.dev/install/batch"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  批量执行的做法
+                </a>
+              </p>
               <OptionRow title={`窗口 ${clock} 后自动关闭`} hint="到点自动失效，装完了也可以现在就关">
                 <Button variant="outline" size="sm" onClick={reg.close}>立即关闭</Button>
               </OptionRow>
@@ -622,6 +638,37 @@ function RegisterDialog({ site, reg, onClose }: {
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// The reporting interval both install dialogs offer. `edited` stays false until
+// the field is changed, including back to 1.
+function useIntervalOption() {
+  const [typed, setTyped] = useState<string>()
+  const text = typed ?? "1"
+  const seconds = Math.min(3600, Math.max(1, Math.round(Number(text) || 1)))
+  return { typed: text, setTyped, edited: typed !== undefined, seconds }
+}
+
+function IntervalOption({ option, batch = false }: { option: ReturnType<typeof useIntervalOption>; batch?: boolean }) {
+  return (
+    <OptionRow
+      title="上报间隔"
+      hint={batch ? "1–3600 秒，默认 1 秒。这一批机器都按这个间隔上报，机器多时可以调大" : "1–3600 秒，默认 1 秒"}
+    >
+      <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
+        {/* Text rather than number: no spinner arrows, and no wheel changing
+            the value under a passing scroll. */}
+        <Input
+          inputMode="numeric"
+          value={option.typed}
+          onChange={(e) => option.setTyped(e.target.value.replace(/\D/g, ""))}
+          aria-label="上报间隔（秒）"
+          className="tnum h-8 w-20 bg-background text-right"
+        />
+        秒
+      </span>
+    </OptionRow>
   )
 }
 
@@ -692,13 +739,12 @@ function InstallDialog({ node, site, onClose, onRotated }: {
   onRotated: () => void
 }) {
   const [token, setToken] = useState(node.token ?? "")
-  const [interval, setInterval] = useState("1")
   const [rotating, setRotating] = useState(false)
   const [confirmRotate, setConfirmRotate] = useState(false)
   const iface = useIfaceOption(currentIface(node))
+  const interval = useIntervalOption()
 
-  const seconds = Math.min(3600, Math.max(1, Math.round(Number(interval) || 1)))
-  const command = token && iface.valid ? installCommand(site, token, seconds, iface.flag) : ""
+  const command = token && iface.valid ? installCommand(site, token, interval.seconds, iface.flag) : ""
 
   async function rotate() {
     setRotating(true)
@@ -724,20 +770,7 @@ function InstallDialog({ node, site, onClose, onRotated }: {
         <div className="space-y-5">
           <section className="space-y-3">
             <h3 className="text-sm font-medium">安装选项</h3>
-            <OptionRow title="上报间隔" hint="1–3600 秒，默认 1 秒">
-              <span className="flex shrink-0 items-center gap-2 text-muted-foreground">
-                {/* Text rather than number: no spinner arrows, and no wheel
-                    changing the value under a passing scroll. */}
-                <Input
-                  inputMode="numeric"
-                  value={interval}
-                  onChange={(e) => setInterval(e.target.value.replace(/\D/g, ""))}
-                  aria-label="上报间隔（秒）"
-                  className="tnum h-8 w-20 bg-background text-right"
-                />
-                秒
-              </span>
-            </OptionRow>
+            <IntervalOption option={interval} />
             <IfaceOption option={iface} />
           </section>
           <section className="space-y-2 border-t pt-5">
