@@ -4,6 +4,26 @@
 //! and the database path is configured in the panel and stored in SQLite,
 //! leaving no config file to track and no secrets in plaintext TOML.
 
+/// Error text written for whoever reads the reply: the only error wording a
+/// response may carry. `api::fail` answers an error with the outermost one in
+/// its chain, and an error without one with a fixed message, logging the chain
+/// in full; a file path, a SQL error or a library's wording stays in the log.
+#[derive(Debug)]
+pub struct Shown(pub String);
+
+impl std::fmt::Display for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// `anyhow::bail!` with a [`Shown`] message.
+macro_rules! refuse {
+    ($($arg:tt)*) => {
+        return Err(anyhow::Error::msg($crate::Shown(format!($($arg)*))))
+    };
+}
+
 mod agent_ws;
 mod api;
 mod auth;
@@ -262,10 +282,10 @@ impl<S: futures_core::Stream + Unpin> futures_core::Stream for Metered<S> {
 /// releases.
 async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Response {
     if !matches!(arch.as_str(), "x86_64" | "aarch64") {
-        return (StatusCode::NOT_FOUND, "unknown architecture").into_response();
+        return api::answer(StatusCode::NOT_FOUND, "unknown architecture");
     }
     let Ok(Ok(permit)) = tokio::time::timeout(RELAY_WAIT, RELAY_GATE.acquire()).await else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again").into_response();
+        return api::answer(StatusCode::SERVICE_UNAVAILABLE, "too many downloads in flight, try again");
     };
     let url = release_url(&app, &arch);
     // The default client timeout is sized for API calls, not a 1.8 MB download.
@@ -279,10 +299,18 @@ async fn agent_binary(State(app): State<Shared>, Path(arch): Path<String>) -> Re
             axum::body::Body::from_stream(metered(Box::pin(res.bytes_stream()), permit)),
         )
             .into_response(),
-        Ok(res) => {
-            (StatusCode::BAD_GATEWAY, format!("release download failed: {}", res.status())).into_response()
+        Ok(res) => api::answer(
+            StatusCode::BAD_GATEWAY,
+            format!("GitHub answered {} for the agent release", res.status()),
+        ),
+        // English, as `install.sh` prints it after its own English line.
+        Err(e) => {
+            warn!("relaying the agent from {url} failed: {e:#}");
+            api::answer(
+                StatusCode::BAD_GATEWAY,
+                "the hub could not reach GitHub or its GitHub proxy; its log has the details",
+            )
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("release download failed: {e}")).into_response(),
     }
 }
 
@@ -443,11 +471,6 @@ async fn main() -> Result<()> {
     tokio::spawn(notify::watch(app.clone()));
 
     let router = Router::new()
-        // Agents.
-        .route("/api/agent/ws", get(agent_ws::handler))
-        .route("/api/agent/register", post(api::agent_register))
-        .route("/install.sh", get(install_script))
-        .route("/agent/{arch}", get(agent_binary))
         // Read paths; the public page reaches these unauthenticated.
         .route("/api/me", get(api::me))
         .route("/api/nodes", get(api::nodes))
@@ -497,6 +520,18 @@ async fn main() -> Result<()> {
                 .route("/api/db/restore", post(api::db_restore))
                 .route("/api/themes", post(api::upload_theme))
                 .layer(tower_http::limit::RequestBodyLimitLayer::new(api::MAX_CHUNK))
+                .with_state(app.clone()),
+        )
+        .layer(axum::middleware::map_response(api::plain_errors))
+        // Agents, merged after that layer: `install.sh` and the agent print these
+        // replies beside their own English output, so they are left as written.
+        .merge(
+            Router::new()
+                .route("/api/agent/ws", get(agent_ws::handler))
+                .route("/api/agent/register", post(api::agent_register))
+                .route("/install.sh", get(install_script))
+                .route("/agent/{arch}", get(agent_binary))
+                .layer(tower_http::limit::RequestBodyLimitLayer::new(64 * 1024))
                 .with_state(app.clone()),
         )
         // Excludes the agent binary and database backups: both are already
