@@ -942,14 +942,14 @@ pub async fn update_nodes(
 }
 
 #[derive(Deserialize)]
-pub struct NodeOrder {
+pub struct Order {
     ids: Vec<i64>,
 }
 
 /// The list must name every node exactly once, checked inside the transaction
 /// that renumbers rather than here: re-reading the node list first would only
 /// race the write it guards.
-pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<NodeOrder>) -> Response {
+pub async fn reorder_nodes(_: Admin, State(app): State<Shared>, Json(order): Json<Order>) -> Response {
     match app.db.reorder_nodes(&order.ids) {
         Ok(()) => {
             invalidate_snapshot(&app);
@@ -1027,6 +1027,15 @@ pub async fn ping_tasks(_: Admin, State(app): State<Shared>) -> Response {
     match app.db.ping_tasks() {
         Ok(tasks) => Json(json!({"tasks": tasks})).into_response(),
         Err(e) => fail(e),
+    }
+}
+
+/// As `reorder_nodes`. Nothing is pushed to the agents: the list they run is in
+/// id order, see `ping_tasks_for`.
+pub async fn reorder_ping_tasks(_: Admin, State(app): State<Shared>, Json(order): Json<Order>) -> Response {
+    match app.db.reorder_ping_tasks(&order.ids) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => bad(&e.to_string()),
     }
 }
 
@@ -1883,6 +1892,11 @@ mod tests {
         App::for_test(Db::open(":memory:").unwrap())
     }
 
+    /// Taken by every test that calls `metrics`. `HISTORY_GATE` is process-wide,
+    /// and a test holding all of its permits would refuse a parallel one with a
+    /// 503. Tokio's mutex, since the guard is held across awaits.
+    static HISTORY_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// A lookup nobody can refresh must not hide an update all day, and a panel
     /// left open on a screen must not ask GitHub on every load.
     #[test]
@@ -2307,8 +2321,8 @@ mod tests {
         assert_eq!(m["net_rx"], 500);
         assert_eq!(m["ts"], base, "stamped with the bucket, so every series shares a grid");
 
-        // Keyed by task rather than index: the rows share a timestamp, so
-        // `ORDER BY ts` leaves their order to SQLite.
+        // Keyed by task rather than index: the order is the panel's, which
+        // `a_probe_chart_follows_the_panel_order` covers.
         let (rows, window_loss) = app.db.ping_records(id, base, 120).unwrap();
         let probe = |task: i64| {
             rows.iter().find(|r| r["task_id"] == task).unwrap_or_else(|| panic!("no probe {task}"))
@@ -3068,6 +3082,7 @@ mod tests {
     /// burst of legitimate requests.
     #[tokio::test]
     async fn history_queries_past_the_gate_are_refused_rather_than_queued() {
+        let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let ask = || {
@@ -3164,6 +3179,7 @@ mod tests {
     /// every row behind it holding the write connection.
     #[tokio::test]
     async fn an_anonymous_history_window_stops_at_a_week() {
+        let _serial = HISTORY_TESTS.lock().await;
         let app = std::sync::Arc::new(app());
         let id = node(&app, "n", true);
         let now = Utc::now().timestamp();

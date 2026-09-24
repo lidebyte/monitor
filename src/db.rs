@@ -123,7 +123,8 @@ CREATE TABLE IF NOT EXISTS ping_task (
   name     TEXT    NOT NULL,
   target   TEXT    NOT NULL,
   interval INTEGER NOT NULL DEFAULT 60,
-  auto_join INTEGER NOT NULL DEFAULT 0
+  auto_join INTEGER NOT NULL DEFAULT 0,
+  sort     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS ping_node (
@@ -161,7 +162,7 @@ CREATE TABLE IF NOT EXISTS session (
 /// cannot: `open` runs `SCHEMA` before migrating, and on an older file the
 /// column is not there yet. `an_upgraded_release_matches_a_fresh_database`
 /// holds every migration to these rules, starting from v1.0.0's schema.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// Adds a column older databases lack. A duplicate column indicates the
 /// migration has already run; every other error must propagate.
@@ -287,6 +288,12 @@ fn migrate_to_8(conn: &Connection) -> Result<()> {
     add_column(conn, "node", "country_prev TEXT NOT NULL DEFAULT ''")
 }
 
+/// Every existing probe ties at 0, so `ORDER BY sort, id` keeps the id order an
+/// upgraded database listed them in.
+fn migrate_to_9(conn: &Connection) -> Result<()> {
+    add_column(conn, "ping_task", "sort INTEGER NOT NULL DEFAULT 0")
+}
+
 /// Brings a database already in service up to `SCHEMA_VERSION` and stamps it.
 /// `from` is its current version, so a fresh file passes `SCHEMA_VERSION` and
 /// receives only the stamp.
@@ -323,6 +330,9 @@ fn migrate(conn: &Connection, from: i64) -> Result<()> {
     }
     if from < 8 {
         migrate_to_8(&tx)?;
+    }
+    if from < 9 {
+        migrate_to_9(&tx)?;
     }
     tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
     tx.commit()?;
@@ -776,19 +786,30 @@ impl Db {
     }
 
     pub fn reorder_nodes(&self, ids: &[i64]) -> Result<()> {
+        self.reorder("node", ids)
+    }
+
+    pub fn reorder_ping_tasks(&self, ids: &[i64]) -> Result<()> {
+        self.reorder("ping_task", ids)
+    }
+
+    /// Renumbers `sort` from a list that must name every row exactly once, so a
+    /// tab that missed an insert or a delete cannot renumber around it.
+    fn reorder(&self, table: &str, ids: &[i64]) -> Result<()> {
         let unique: HashSet<_> = ids.iter().collect();
         if unique.len() != ids.len() {
-            anyhow::bail!("node order contains duplicates");
+            anyhow::bail!("排序里有重复的条目");
         }
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let count: i64 = tx.query_row("SELECT COUNT(*) FROM node", [], |r| r.get(0))?;
+        let count: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
         if count as usize != ids.len() {
-            anyhow::bail!("node order must include every node");
+            anyhow::bail!("列表已在别处改动，刷新后再排序");
         }
+        let sql = format!("UPDATE {table} SET sort=?2 WHERE id=?1");
         for (sort, id) in ids.iter().enumerate() {
-            if tx.execute("UPDATE node SET sort=?2 WHERE id=?1", params![id, sort as i64])? != 1 {
-                anyhow::bail!("node order contains an unknown node");
+            if tx.execute(&sql, params![id, sort as i64])? != 1 {
+                anyhow::bail!("列表已在别处改动，刷新后再排序");
             }
         }
         tx.commit()?;
@@ -1224,7 +1245,7 @@ impl Db {
     pub fn ping_tasks(&self) -> Result<Vec<PingTask>> {
         let conn = self.conn();
         let mut stmt =
-            conn.prepare("SELECT id, name, target, interval, auto_join FROM ping_task ORDER BY id")?;
+            conn.prepare("SELECT id, name, target, interval, auto_join FROM ping_task ORDER BY sort, id")?;
         let tasks: Vec<PingTask> = stmt
             .query_map([], |r| {
                 Ok(PingTask {
@@ -1287,8 +1308,10 @@ impl Db {
             }
             t.id
         } else {
+            // At the end, as in `create_node`.
             tx.execute(
-                "INSERT INTO ping_task (name, target, interval, auto_join) VALUES (?1,?2,?3,?4)",
+                "INSERT INTO ping_task (name, target, interval, auto_join, sort)
+                 VALUES (?1,?2,?3,?4,(SELECT COALESCE(MAX(sort),-1)+1 FROM ping_task))",
                 params![t.name, t.target, t.interval, t.auto_join],
             )?;
             tx.last_insert_rowid()
@@ -1375,6 +1398,9 @@ impl Db {
     /// the timers each time; `save_ping_task` prevents reaching that boundary,
     /// and this makes the backstop deterministic should a database arrive there
     /// by another route.
+    ///
+    /// By id rather than the panel's `sort`, so reordering in the panel changes
+    /// nothing an agent holds and needs no push.
     pub fn ping_tasks_for(&self, node_id: i64) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
@@ -1511,6 +1537,26 @@ impl Db {
             }
         }
         close_bucket(&mut out, &mut open, bucket * step);
+        // Probe by probe in the panel's order, each probe's rows still in time
+        // order. Themes take their series, colours and legend from the order in
+        // which probes first appear; bucket by bucket, that would be whichever
+        // probe happened to answer inside the window's partial first bucket.
+        let rank: HashMap<i64, usize> = conn
+            .prepare_cached("SELECT id FROM ping_task ORDER BY sort, id")?
+            .query_map([], |r| r.get(0))?
+            .enumerate()
+            .map(|(i, id)| id.map(|id| (id, i)))
+            .collect::<Result<_, _>>()?;
+        // Sorted after releasing the connection the agents write through. A
+        // probe missing from the rank, which the assignment filter in
+        // `PING_ROWS` rules out today, goes last rather than taking the first
+        // colour.
+        drop(rows);
+        drop(stmt);
+        drop(conn);
+        out.sort_by_cached_key(|row| {
+            row["task_id"].as_i64().and_then(|id| rank.get(&id).copied()).unwrap_or(usize::MAX)
+        });
         // Unrounded: the caller decides how to render it, and rounding here would
         // turn 0.14% into the 0% that denotes no loss at all.
         let loss: serde_json::Map<String, serde_json::Value> = totals
@@ -1809,9 +1855,6 @@ impl Db {
 /// of a `loss` key means no timeouts occurred: truncating would report a bucket
 /// that lost 1 of 180 as clean.
 fn close_bucket(out: &mut Vec<serde_json::Value>, open: &mut Vec<(i64, Vec<i64>, i64)>, ts: i64) {
-    // Ordered by probe rather than by which answered first in this bucket, since
-    // the chart shades its lines by arrival order.
-    open.sort_unstable_by_key(|(task, ..)| *task);
     for (task, mut answered, lost) in open.drain(..) {
         answered.sort_unstable();
         let middle = match answered.len() {
@@ -2598,6 +2641,36 @@ mod tests {
         // places it.
         let d = node(&db, 1);
         assert_eq!(db.nodes().unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), vec![c, a, b, d]);
+    }
+
+    /// Themes draw probes in the order they first appear in the rows, so the rows
+    /// follow the panel's order even when a later probe alone answered in the
+    /// window's first bucket.
+    #[test]
+    fn a_probe_chart_follows_the_panel_order() {
+        let db = db();
+        let id = node(&db, 1);
+        let probe = |name: &str| {
+            db.save_ping_task(&PingTask {
+                name: name.into(),
+                target: "1.1.1.1:443".into(),
+                interval: 60,
+                nodes: vec![id],
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        let (a, b) = (probe("a"), probe("b"));
+        db.reorder_ping_tasks(&[b, a]).unwrap();
+        let c = probe("c");
+        let listed: Vec<_> = db.ping_tasks().unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(listed, vec![b, a, c], "a new probe starts at the end");
+
+        db.insert_pings(id, &[(a, 0, 10), (a, 60, 10), (b, 60, 20), (c, 60, 30)]).unwrap();
+        let rows = db.ping_records(id, 0, 60).unwrap().0;
+        let drawn: Vec<_> =
+            rows.iter().map(|r| (r["task_id"].as_i64().unwrap(), r["ts"].as_i64().unwrap())).collect();
+        assert_eq!(drawn, vec![(b, 60), (a, 0), (a, 60), (c, 60)]);
     }
 
     #[test]

@@ -31,10 +31,157 @@ const TRAFFIC_MODES: Record<string, string> = {
 }
 
 // Reordering uses the browser's view transitions, so displaced rows slide.
-// Browsers without support jump instead.
+// Browsers without support jump instead. A drag starts a transition on every row
+// it crosses, each skipping the last, and a skipped transition rejects `ready`.
 function animate(update: () => void) {
-  if (document.startViewTransition) document.startViewTransition(() => flushSync(update))
-  else update()
+  if (document.startViewTransition) document.startViewTransition(() => flushSync(update)).ready.catch(() => {})
+  else flushSync(update)
+}
+
+// Drag-to-reorder for a table whose order the hub stores at `/${path}/order`.
+// Rows are displaced while the pointer is down and the whole order is saved on
+// release, so a filtered table must disable its handles: the rows on screen are
+// then not `order`.
+function useDragOrder<T extends { id: number }>(items: T[], path: string, reload: () => void) {
+  const [manualOrder, setManualOrder] = useState<number[]>([])
+  const [dragging, setDragging] = useState<number | null>(null)
+  const orderBeforeDrag = useRef<number[]>([])
+  // The order last asked for. A view transition renders it a frame or more
+  // later, and a repeated key or a quick drag must build on it rather than on
+  // the order still on screen.
+  const pending = useRef<number[] | null>(null)
+  const body = useRef<HTMLTableSectionElement | null>(null)
+  // One save in flight at a time, so two quick reorders reach the hub in order.
+  const saving = useRef<Promise<unknown>>(Promise.resolve())
+  const byId = new Map(items.map((item) => [item.id, item]))
+  const orderedIds = new Set(manualOrder)
+  const order = [
+    ...manualOrder.map((id) => byId.get(id)).filter((item): item is T => Boolean(item)),
+    ...items.filter((item) => !orderedIds.has(item.id)),
+  ]
+  const ids = () => pending.current ?? order.map((item) => item.id)
+
+  // Once the hub lists this order, its list is followed again, so a reorder made
+  // in another tab appears here instead of being overwritten by the next drag.
+  if (dragging === null && manualOrder.length && manualOrder.join() === items.map((item) => item.id).join()) {
+    setManualOrder([])
+  }
+
+  // Handled on the document by where the pointer is, not by the row under it:
+  // while a view transition runs, Chrome hit-tests drag events to the root
+  // element, so row handlers would miss every row crossed during a 150 ms slide,
+  // and a release then would count as a drop outside the table. Re-attached on
+  // every render, since `order` changes as rows are displaced.
+  useEffect(() => {
+    const rows = body.current
+    if (dragging === null || !rows) return
+    const over = (e: DragEvent) => {
+      const table = rows.getBoundingClientRect()
+      if (e.clientX < table.left || e.clientX > table.right || e.clientY < table.top || e.clientY > table.bottom) return
+      e.preventDefault()
+      if (e.type === "drop") return
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move"
+      const at = [...rows.rows].findIndex((row) => {
+        const r = row.getBoundingClientRect()
+        return e.clientY >= r.top && e.clientY < r.bottom
+      })
+      // By position rather than by the row there, which may be one a pending
+      // transition has yet to move.
+      if (at >= 0) move(dragging, at)
+    }
+    document.addEventListener("dragover", over)
+    document.addEventListener("drop", over)
+    return () => {
+      document.removeEventListener("dragover", over)
+      document.removeEventListener("drop", over)
+    }
+  })
+
+  // A transition superseded before it ran applies nothing: a later move, or a
+  // refused save falling back to the hub's order, has replaced it.
+  function show(next: number[]) {
+    pending.current = next
+    animate(() => {
+      if (pending.current !== next) return
+      pending.current = null
+      setManualOrder(next)
+    })
+  }
+
+  function move(id: number, to: number) {
+    const next = [...ids()]
+    const from = next.indexOf(id)
+    if (from < 0 || to < 0 || to >= next.length || from === to) return
+    next.splice(to, 0, ...next.splice(from, 1))
+    show(next)
+    return next
+  }
+
+  // Dropped outside the table or cancelled with Escape: the order is restored.
+  function cancel() {
+    setDragging(null)
+    if (orderBeforeDrag.current.length) show(orderBeforeDrag.current)
+  }
+
+  function save(next: number[]) {
+    setDragging(null)
+    const before = orderBeforeDrag.current
+    if (!before.length || next.join() === before.join()) return
+    orderBeforeDrag.current = next
+    const put = () => api(`/${path}/order`, { method: "PUT", body: JSON.stringify({ ids: next }) })
+    // A refusal falls back to whatever the hub holds, which a save queued
+    // behind it may still change.
+    saving.current = saving.current.then(put).then(reload, (e: Error) => {
+      pending.current = null
+      setManualOrder([])
+      reload()
+      toast.error(e.message)
+    })
+  }
+
+  return {
+    order,
+    row: (id: number) => ({
+      style: { viewTransitionName: `${path}-${id}` },
+      "data-dragging": dragging === id || undefined,
+      className: "transition-opacity data-[dragging]:opacity-40",
+    }),
+    handle: (id: number) => ({
+      onDragStart: (e: React.DragEvent<HTMLElement>) => {
+        orderBeforeDrag.current = ids()
+        body.current = e.currentTarget.closest("tbody")
+        setDragging(id)
+        e.dataTransfer.effectAllowed = "move"
+        // Firefox refuses to start a drag without a payload.
+        e.dataTransfer.setData("text/plain", String(id))
+      },
+      onDragEnd: (e: React.DragEvent) => (e.dataTransfer.dropEffect === "none" ? cancel() : save(ids())),
+      onKeyDown: (e: React.KeyboardEvent) => {
+        const delta = e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : 0
+        if (!delta) return
+        e.preventDefault()
+        orderBeforeDrag.current = ids()
+        const next = move(id, ids().indexOf(id) + delta)
+        if (next) save(next)
+      },
+    }),
+  }
+}
+
+function DragHandle({ name, disabled, title = "拖动排序", ...events }: React.ComponentProps<"button"> & { name: string }) {
+  return (
+    <button
+      type="button"
+      draggable={!disabled}
+      disabled={disabled}
+      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+      title={title}
+      aria-label={`拖动 ${name} 排序`}
+      {...events}
+    >
+      <GripVertical className="size-4" />
+    </button>
+  )
 }
 
 function copy(text: string) {
@@ -1089,21 +1236,11 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const reg = useRegisterWindow()
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
-  const [manualOrder, setManualOrder] = useState<number[]>([])
   const [query, setQuery] = useState("")
   const [group, setGroup] = useGroupFilter(nodes)
   const [grouping, setGrouping] = useState(false)
-  const [dragging, setDragging] = useState<number | null>(null)
-  const orderBeforeDrag = useRef<number[]>([])
-  const byId = new Map(nodes.map((node) => [node.id, node]))
-  const orderedIds = new Set(manualOrder)
-  const order = [
-    ...manualOrder.map((id) => byId.get(id)).filter((node): node is Node => Boolean(node)),
-    ...nodes.filter((node) => !orderedIds.has(node.id)),
-  ]
-  // `order` itself stays whole, because the order sent on drop is the order of
-  // every node.
-  const visible = inGroup(searchNodes(order, query), group)
+  const drag = useDragOrder(nodes, "nodes", refresh)
+  const visible = inGroup(searchNodes(drag.order, query), group)
   const searching = query.trim() !== "" || group !== "all"
   const uninstall = refusal ? "" : uninstallCommand(site)
 
@@ -1120,34 +1257,6 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
     } finally {
       setRemoving(false)
     }
-  }
-
-  // Rows are displaced while the pointer is down; the order is saved on drop.
-  function move(from: number, to: number) {
-    if (from < 0 || to < 0 || to >= order.length || from === to) return
-    const next = [...order]
-    next.splice(to, 0, ...next.splice(from, 1))
-    const ids = next.map((node) => node.id)
-    animate(() => setManualOrder(ids))
-    return ids
-  }
-
-  // Dropped outside the table or cancelled with Escape: the order is restored.
-  function cancel() {
-    setDragging(null)
-    const rollback = orderBeforeDrag.current
-    if (rollback.length) animate(() => setManualOrder(rollback))
-  }
-
-  function save(ids: number[]) {
-    setDragging(null)
-    const rollback = orderBeforeDrag.current
-    if (!rollback.length || ids.join() === rollback.join()) return
-    orderBeforeDrag.current = ids
-    api("/nodes/order", { method: "PUT", body: JSON.stringify({ ids }) }).then(refresh, (e: Error) => {
-      setManualOrder(rollback)
-      toast.error(e.message)
-    })
   }
 
   return (
@@ -1187,47 +1296,16 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
             </TableRow>
           </TableHeader>
           <TableBody>
-            {visible.map((n, index) => (
-              <TableRow
-                key={n.id}
-                style={{ viewTransitionName: `node-${n.id}` }}
-                data-dragging={dragging === n.id || undefined}
-                className="transition-opacity data-[dragging]:opacity-40"
-                onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move" }}
-                onDragEnter={() => dragging !== null && move(order.findIndex((node) => node.id === dragging), index)}
-                onDrop={(e) => { e.preventDefault(); save(order.map((node) => node.id)) }}
-              >
+            {visible.map((n) => (
+              <TableRow key={n.id} {...drag.row(n.id)}>
                 <TableCell>
                   <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      draggable={!searching}
-                      // A drop sends the order of every node, and a filtered list
-                      // offers only its own rows to drop onto, so the index below
-                      // is the full one exactly while nothing is filtered out.
+                    <DragHandle
+                      {...drag.handle(n.id)}
+                      name={n.name}
                       disabled={searching}
-                      className="cursor-grab touch-none rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground active:cursor-grabbing disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
-                      title={searching ? "清空搜索和分组筛选后可拖动排序" : "拖动排序"}
-                      aria-label={`拖动 ${n.name} 排序`}
-                      onDragStart={(e) => {
-                        orderBeforeDrag.current = order.map((node) => node.id)
-                        setDragging(n.id)
-                        e.dataTransfer.effectAllowed = "move"
-                        // Firefox refuses to start a drag without a payload.
-                        e.dataTransfer.setData("text/plain", String(n.id))
-                      }}
-                      onDragEnd={(e) => (e.dataTransfer.dropEffect === "none" ? cancel() : save(order.map((node) => node.id)))}
-                      onKeyDown={(e) => {
-                        const delta = e.key === "ArrowUp" ? -1 : e.key === "ArrowDown" ? 1 : 0
-                        if (!delta) return
-                        e.preventDefault()
-                        orderBeforeDrag.current = order.map((node) => node.id)
-                        const ids = move(index, index + delta)
-                        if (ids) save(ids)
-                      }}
-                    >
-                      <GripVertical className="size-4" />
-                    </button>
+                      title={searching ? "清空搜索和分组筛选后可拖动排序" : undefined}
+                    />
                     <div className="min-w-0">
                       <div className="font-medium">{n.name}</div>
                       {n.group && <div className="truncate text-xs text-muted-foreground">{n.group}</div>}
@@ -1320,7 +1398,7 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
           onSaved={refresh}
         />
       )}
-      {grouping && <GroupDialog nodes={order} onClose={() => setGrouping(false)} onSaved={refresh} />}
+      {grouping && <GroupDialog nodes={drag.order} onClose={() => setGrouping(false)} onSaved={refresh} />}
       {billing && (
         <BillingForm node={billing} onClose={() => setBilling(null)} onSaved={refresh} />
       )}
@@ -1471,6 +1549,8 @@ function Ping({ nodes }: { nodes: Node[] }) {
   // A node added or removed changes assignments on the hub: auto_join adds, a
   // deletion cascades.
   useEffect(() => { load() }, [nodes.length])
+  // Unfiltered, so the handles are never disabled.
+  const drag = useDragOrder(tasks, "ping-tasks", load)
 
   async function remove() {
     if (!deleting) return
@@ -1507,9 +1587,14 @@ function Ping({ nodes }: { nodes: Node[] }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {tasks.map((t) => (
-              <TableRow key={t.id}>
-                <TableCell className="font-medium">{t.name}</TableCell>
+            {drag.order.map((t) => (
+              <TableRow key={t.id} {...drag.row(t.id)}>
+                <TableCell className="font-medium">
+                  <div className="flex items-center gap-2">
+                    <DragHandle {...drag.handle(t.id)} name={t.name} />
+                    {t.name}
+                  </div>
+                </TableCell>
                 <TableCell className="tnum text-sm">{t.target}</TableCell>
                 <TableCell className="tnum text-sm">{t.interval}s</TableCell>
                 <TableCell className="text-sm whitespace-nowrap text-muted-foreground">
