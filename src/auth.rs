@@ -349,9 +349,7 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
     else {
         refuse!("没有配置 GitHub 登录");
     };
-    let allowed = app.db.get("github_allowed_users").unwrap_or_default();
-    let allowed: Vec<String> =
-        allowed.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
+    let allowed = allowed_logins(&app.db.get("github_allowed_users").unwrap_or_default());
     if allowed.is_empty() {
         // Without an allow list, any GitHub account could sign in.
         refuse!("没有设置允许登录的 GitHub 用户");
@@ -383,6 +381,7 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct GithubUser {
         login: String,
+        id: i64,
     }
     let response = app
         .http
@@ -407,8 +406,50 @@ async fn github_login(app: &App, code: &str) -> Result<String> {
         warn!("GitHub user {} is not on the allowed list {allowed:?}", user.login);
         refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
     }
+    let id = user.id.to_string();
+    match app.db.bind_github(&user.login.to_lowercase(), &id)? {
+        None => {
+            warn!("GitHub user {} was removed from the allowed list during sign-in", user.login);
+            refuse!("GitHub 用户 {} 不在允许登录的名单里", user.login);
+        }
+        Some(bound) if bound != id => {
+            warn!(
+                "GitHub user {} is account {id}, but the name first signed in as account {bound}",
+                user.login
+            );
+            refuse!(
+                "GitHub 用户 {} 已经不是第一次登录时的那个账号。如果账号确实重建过，先把它从允许名单里删掉并保存，再加回来",
+                user.login
+            );
+        }
+        Some(_) => {}
+    }
     info!("GitHub sign-in accepted for {}", user.login);
     Ok(user.login)
+}
+
+/// The GitHub account each listed login belonged to when it first signed in,
+/// as `login:id` pairs. The list names logins, and a renamed or deleted
+/// account leaves its login free for anyone to register.
+pub const GITHUB_IDS: &str = "github_user_ids";
+
+/// The logins of the allow list, in the case GitHub ignores.
+pub fn allowed_logins(list: &str) -> Vec<String> {
+    list.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+}
+
+pub fn bound_id<'a>(ids: &'a str, login: &str) -> Option<&'a str> {
+    ids.split(',').filter_map(|pair| pair.split_once(':')).find(|(l, _)| *l == login).map(|(_, id)| id)
+}
+
+/// `ids` without the logins `list` no longer allows, so a login removed and
+/// added back binds afresh on its next sign-in.
+pub fn keep_listed(ids: &str, list: &str) -> String {
+    let allowed = allowed_logins(list);
+    ids.split(',')
+        .filter(|pair| pair.split_once(':').is_some_and(|(l, _)| allowed.iter().any(|a| a == l)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Peer address, or the last hop in X-Forwarded-For when the request arrived
