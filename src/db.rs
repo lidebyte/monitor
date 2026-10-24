@@ -2895,26 +2895,15 @@ mod tests {
         assert_eq!(read("busy_timeout"), 5_000);
     }
 
-    /// A real file, for the tests that exercise what happens to one. Removed with
-    /// its companions when dropped.
-    struct Scratch(String);
+    /// A real file, for the tests that exercise what happens to one. It sits alone
+    /// in a [`crate::TempDir`], so its journal and every file a test puts beside it
+    /// go with it.
+    struct Scratch(String, #[expect(dead_code, reason = "held for its Drop")] crate::TempDir);
 
     impl Scratch {
         fn new() -> Self {
-            Self(
-                std::env::temp_dir()
-                    .join(format!("monitor-test-{}.db", rand::random::<u64>()))
-                    .to_string_lossy()
-                    .into_owned(),
-            )
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm", ".copy"] {
-                let _ = std::fs::remove_file(format!("{}{suffix}", self.0));
-            }
+            let dir = crate::TempDir::new("test");
+            Self(dir.0.join("monitor.db").to_string_lossy().into_owned(), dir)
         }
     }
 
@@ -3054,8 +3043,6 @@ mod tests {
             SCHEMA_VERSION
         );
         assert_eq!(conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0)).unwrap(), "wal");
-        drop(conn);
-        let _ = std::fs::remove_file(&copy);
     }
 
     /// An unknown pragma is a silent no-op in SQLite, so only reading it back
@@ -3589,9 +3576,8 @@ mod tests {
     /// deleted before anything is created keep their ids out of circulation.
     #[test]
     fn an_upgraded_database_does_not_reissue_the_newest_ids() {
-        let file = std::env::temp_dir().join(format!("monitor-marks-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&file);
-        let path = file.to_str().unwrap();
+        let scratch = Scratch::new();
+        let path = &scratch.0;
         let db = Db::open(path).unwrap();
         let (_, newest) = (node(&db, 1), node(&db, 1));
         let probe = |name: &str| PingTask {
@@ -3614,8 +3600,6 @@ mod tests {
         let other = node(&db, 1);
         let fresh = db.save_ping_task(&PingTask { nodes: vec![other], ..probe("osaka") }).unwrap();
         assert!(fresh > task, "the newest probe's id is issued again");
-        drop(db);
-        std::fs::remove_file(&file).unwrap();
     }
 
     /// An earlier build deleting a node or a probe runs only its own statements,
@@ -4061,9 +4045,8 @@ mod tests {
     /// scans a node's entire history.
     #[test]
     fn rekeying_ping_record_keeps_the_rows_and_lets_the_chart_query_seek() {
-        let file = std::env::temp_dir().join(format!("monitor-rekey-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&file);
-        let path = file.to_str().unwrap();
+        let scratch = Scratch::new();
+        let path = &scratch.0;
 
         // A database as an older hub left it.
         let old = Connection::open(path).unwrap();
@@ -4107,7 +4090,6 @@ mod tests {
         drop(conn);
         drop(db);
         assert!(Db::open(path).is_ok());
-        let _ = std::fs::remove_file(&file);
     }
 
     /// Every row of every table, comparable across two opens of one file. A
@@ -4214,9 +4196,8 @@ mod tests {
     /// from being written.
     #[test]
     fn dropping_load1_keeps_the_history_and_lets_new_rows_in() {
-        let file = std::env::temp_dir().join(format!("monitor-load1-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&file);
-        let path = file.to_str().unwrap();
+        let scratch = Scratch::new();
+        let path = &scratch.0;
 
         // A database as a hub predating this build left it: one metric row
         // carrying a load average, stamped with the schema version of the time.
@@ -4248,7 +4229,6 @@ mod tests {
         // Opening again must not attempt to drop a column already removed.
         drop(db);
         assert!(Db::open(path).is_ok());
-        let _ = std::fs::remove_file(&file);
     }
 
     /// Removing a node from a probe must remove the probe from that node's chart.
